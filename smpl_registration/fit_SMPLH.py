@@ -14,8 +14,9 @@ import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 from os.path import exists
-from pytorch3d.loss import point_mesh_face_distance
+from pytorch3d.loss import point_mesh_face_distance, chamfer_distance
 from pytorch3d.structures import Meshes, Pointclouds
+from pytorch3d.ops import sample_points_from_meshes
 from smpl_registration.base_fitter import BaseFitter
 from lib.body_objectives import batch_get_pose_obj, batch_3djoints_loss
 from lib.smpl.priors.th_smpl_prior import get_prior
@@ -36,7 +37,7 @@ class SMPLHFitter(BaseFitter):
         smpl = self.init_smpl(batch_sz, gender, trans=centers) # add centers as initial SMPL translation
 
         # Set optimization hyper parameters
-        iterations, pose_iterations, steps_per_iter, pose_steps_per_iter = 5, 5, 30, 30
+        iterations, pose_iterations, steps_per_iter, pose_steps_per_iter = 8, 0, 40, 0
 
         th_pose_3d = None
         #if pose_files is not None:
@@ -83,32 +84,101 @@ class SMPLHFitter(BaseFitter):
 
         print('** Optimised smpl pose and shape **')
 
+    # def forward_pose_shape(self, th_scan_meshes, smpl, th_pose_3d=None):
+        # # Get pose prior
+        # prior = get_prior(self.model_root, smpl.gender)
+
+        # # forward
+        # verts, _, _, _ = smpl()
+        # th_smpl_meshes = Meshes(verts=verts, faces=torch.stack([smpl.faces] * len(verts), dim=0))
+
+        # # losses
+        # loss = dict()
+        # loss['s2m'] = point_mesh_face_distance(th_smpl_meshes, Pointclouds(points=th_scan_meshes.verts_list()))
+        # loss['m2s'] = point_mesh_face_distance(th_scan_meshes, Pointclouds(points=th_smpl_meshes.verts_list()))
+        # loss['betas'] = torch.mean(smpl.betas ** 2)
+        # loss['pose_pr'] = torch.mean(prior(smpl.pose))
+        # if self.hands:
+            # hand_prior = HandPrior(self.model_root, type='grab')
+            # loss['hand'] = torch.mean(hand_prior(smpl.pose)) # add hand prior if smplh is used
+        # if th_pose_3d is not None:
+            # # 3D joints loss
+            # J, face, hands = smpl.get_landmarks()
+            # joints = self.compose_smpl_joints(J, face, hands, th_pose_3d)
+            # j3d_loss = batch_3djoints_loss(th_pose_3d, joints)
+            # loss['pose_obj'] = j3d_loss
+            # # loss['pose_obj'] = batch_get_pose_obj(th_pose_3d, smpl).mean()
+        # return loss
+    
     def forward_pose_shape(self, th_scan_meshes, smpl, th_pose_3d=None):
         # Get pose prior
         prior = get_prior(self.model_root, smpl.gender)
 
         # forward
         verts, _, _, _ = smpl()
-        th_smpl_meshes = Meshes(verts=verts, faces=torch.stack([smpl.faces] * len(verts), dim=0))
+        th_smpl_meshes = Meshes(
+            verts=verts,
+            faces=torch.stack([smpl.faces] * len(verts), dim=0)
+        )
 
         # losses
         loss = dict()
-        loss['s2m'] = point_mesh_face_distance(th_smpl_meshes, Pointclouds(points=th_scan_meshes.verts_list()))
-        loss['m2s'] = point_mesh_face_distance(th_scan_meshes, Pointclouds(points=th_smpl_meshes.verts_list()))
+
+        # point-to-mesh losses originais
+        loss['s2m'] = point_mesh_face_distance(
+            th_smpl_meshes,
+            Pointclouds(points=th_scan_meshes.verts_list())
+        )
+
+        loss['m2s'] = point_mesh_face_distance(
+            th_scan_meshes,
+            Pointclouds(points=th_smpl_meshes.verts_list())
+        )
+
+        # ------------------------------------------------------------------
+        # NOVA LOSS: Chamfer distance entre pontos amostrados do SMPL e scan
+        # ------------------------------------------------------------------
+        
+        num_samples = 10000
+
+        smpl_samples = sample_points_from_meshes(
+            th_smpl_meshes,
+            num_samples=num_samples
+        )
+
+        scan_verts = th_scan_meshes.verts_list()[0]
+        if scan_verts.shape[0] > num_samples:
+            idx = torch.randperm(scan_verts.shape[0], device=scan_verts.device)[:num_samples]
+            scan_verts = scan_verts[idx]
+
+        scan_points = scan_verts.unsqueeze(0)  # (1, N, 3)
+
+        chamfer_loss, _ = chamfer_distance(
+            smpl_samples,
+            scan_points)
+            
+        
+        
+        loss['chamfer'] = chamfer_loss
+
+        # regularização de shape
         loss['betas'] = torch.mean(smpl.betas ** 2)
+
+        # prior de pose
         loss['pose_pr'] = torch.mean(prior(smpl.pose))
+
         if self.hands:
             hand_prior = HandPrior(self.model_root, type='grab')
-            loss['hand'] = torch.mean(hand_prior(smpl.pose)) # add hand prior if smplh is used
+            loss['hand'] = torch.mean(hand_prior(smpl.pose))
+
         if th_pose_3d is not None:
             # 3D joints loss
             J, face, hands = smpl.get_landmarks()
             joints = self.compose_smpl_joints(J, face, hands, th_pose_3d)
             j3d_loss = batch_3djoints_loss(th_pose_3d, joints)
             loss['pose_obj'] = j3d_loss
-            # loss['pose_obj'] = batch_get_pose_obj(th_pose_3d, smpl).mean()
-        return loss
 
+        return loss
 
 
     def compose_smpl_joints(self, J, face, hands, th_pose_3d):
@@ -199,7 +269,9 @@ class SMPLHFitter(BaseFitter):
         """Set loss weights"""
         loss_weight = {'s2m': lambda cst, it: 20. ** 2 * cst * (1 + it),
                        'm2s': lambda cst, it: 20. ** 2 * cst / (1 + it),
-                       'betas': lambda cst, it: 10. ** 1.0 * cst / (1 + it),
+                       'betas': lambda cst, it: 10. ** 0.0 * cst / (1 + it),
+                       # nova loss geométrica
+                       'chamfer': lambda cst, it: 10. ** 2 * cst,
                        'offsets': lambda cst, it: 10. ** -1 * cst / (1 + it),
                        'pose_pr': lambda cst, it: 10. ** -5 * cst / (1 + it),
                        'hand': lambda cst, it: 10. ** -5 * cst / (1 + it),
