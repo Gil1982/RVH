@@ -1,4 +1,5 @@
 import os
+import math
 import numpy as np
 import trimesh
 import torch
@@ -184,6 +185,192 @@ def save_overlay_glb(scan_colored: trimesh.Trimesh,
     scene.export(out_glb)
 
 
+def convex_hull_2d(points_2d: np.ndarray) -> np.ndarray:
+    """Retorna os pontos do casco convexo 2D em ordem (algoritmo monotonic chain)."""
+    if points_2d.shape[0] < 3:
+        return np.empty((0, 2), dtype=np.float64)
+
+    pts = sorted(set((float(x), float(y)) for x, y in points_2d))
+    if len(pts) < 3:
+        return np.empty((0, 2), dtype=np.float64)
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower = []
+    for pt in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], pt) <= 0:
+            lower.pop()
+        lower.append(pt)
+
+    upper = []
+    for pt in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], pt) <= 0:
+            upper.pop()
+        upper.append(pt)
+
+    hull = lower[:-1] + upper[:-1]
+    if len(hull) < 3:
+        return np.empty((0, 2), dtype=np.float64)
+    return np.asarray(hull, dtype=np.float64)
+
+
+<<<<<<< ours
+=======
+def infer_body_axes(vertices: np.ndarray) -> Tuple[int, int, int]:
+    """Infer (up, left-right, depth) axes from bbox extents."""
+    ext = vertices.max(axis=0) - vertices.min(axis=0)
+    up_axis = int(np.argmax(ext))
+    rem = [a for a in [0, 1, 2] if a != up_axis]
+    if ext[rem[0]] >= ext[rem[1]]:
+        lr_axis, depth_axis = rem[0], rem[1]
+    else:
+        lr_axis, depth_axis = rem[1], rem[0]
+    return up_axis, lr_axis, depth_axis
+
+
+>>>>>>> theirs
+def anthropometric_ring_points(mesh: trimesh.Trimesh,
+                               rel_height: float,
+                               band_rel: float = 0.012,
+                               side: Optional[str] = None) -> np.ndarray:
+<<<<<<< ours
+    """Estimativa de anel 3D (XZ em altura Y fixa) para uma circunferência antropométrica."""
+    verts = np.asarray(mesh.vertices)
+    y = verts[:, 1]
+    y_min, y_max = float(y.min()), float(y.max())
+    h = max(y_max - y_min, 1e-8)
+    y_target = y_min + rel_height * h
+    band = max(band_rel * h, 1e-5)
+
+    keep = np.abs(y - y_target) <= band
+    if side == 'left':
+        keep &= verts[:, 0] > 0
+    elif side == 'right':
+        keep &= verts[:, 0] < 0
+
+    pts = verts[keep][:, [0, 2]]
+=======
+    """Estimativa de anel 3D para uma circunferência antropométrica."""
+    verts = np.asarray(mesh.vertices)
+    up_axis, lr_axis, depth_axis = infer_body_axes(verts)
+
+    up = verts[:, up_axis]
+    up_min, up_max = float(up.min()), float(up.max())
+    h = max(up_max - up_min, 1e-8)
+    up_target = up_min + rel_height * h
+    band = max(band_rel * h, 1e-5)
+
+    keep = np.abs(up - up_target) <= band
+    if side == 'left':
+        keep &= verts[:, lr_axis] > 0
+    elif side == 'right':
+        keep &= verts[:, lr_axis] < 0
+
+    pts = verts[keep][:, [lr_axis, depth_axis]]
+>>>>>>> theirs
+    if pts.shape[0] < 16:
+        return np.empty((0, 3), dtype=np.float64)
+
+    hull = convex_hull_2d(pts)
+    if hull.shape[0] < 3:
+        return np.empty((0, 3), dtype=np.float64)
+
+<<<<<<< ours
+    ring = np.column_stack([hull[:, 0], np.full(hull.shape[0], y_target), hull[:, 1]])
+    # fecha o loop
+=======
+    ring = np.zeros((hull.shape[0], 3), dtype=np.float64)
+    ring[:, lr_axis] = hull[:, 0]
+    ring[:, depth_axis] = hull[:, 1]
+    ring[:, up_axis] = up_target
+>>>>>>> theirs
+    ring = np.vstack([ring, ring[:1]])
+    return ring
+
+
+def add_ring_to_scene(scene: trimesh.Scene,
+                      ring_points: np.ndarray,
+                      color_rgba: Tuple[int, int, int, int],
+                      node_name: str) -> bool:
+    if ring_points.shape[0] < 4:
+        return False
+    path = trimesh.load_path(ring_points)
+    if hasattr(path, 'colors'):
+        path.colors = np.tile(np.array([color_rgba], dtype=np.uint8), (len(path.entities), 1))
+    scene.add_geometry(path, node_name=node_name)
+    return True
+
+
+def best_ring_in_window(mesh: trimesh.Trimesh,
+                        rel_range: Tuple[float, float],
+                        mode: str,
+                        band_rel: float,
+                        side: Optional[str] = None,
+                        steps: int = 15) -> Tuple[np.ndarray, float]:
+    rel_values = np.linspace(rel_range[0], rel_range[1], steps)
+    best_ring = np.empty((0, 3), dtype=np.float64)
+    best_val = np.nan
+
+    for rel_h in rel_values:
+        ring = anthropometric_ring_points(mesh, float(rel_h), band_rel=band_rel, side=side)
+        if ring.shape[0] < 4:
+            continue
+        seg = np.linalg.norm(np.diff(ring, axis=0), axis=1)
+        circ = float(seg.sum())
+        if np.isnan(best_val):
+            best_ring = ring
+            best_val = circ
+            continue
+        if (mode == 'max' and circ > best_val) or (mode == 'min' and circ < best_val):
+            best_ring = ring
+            best_val = circ
+
+    return best_ring, float(best_val) if not np.isnan(best_val) else float('nan')
+
+
+def add_anthropometric_rings(scene: trimesh.Scene, mesh: trimesh.Trimesh) -> int:
+    """Adiciona anéis antropométricos adaptativos ao scene; retorna quantidade desenhada."""
+    specs = [
+        ('chest', (0.72, 0.86), 'max', 0.012, None, (255, 60, 60, 255)),
+        ('waist', (0.56, 0.70), 'min', 0.012, None, (255, 200, 0, 255)),
+        ('hip', (0.45, 0.60), 'max', 0.012, None, (40, 220, 40, 255)),
+        ('biceps_left', (0.67, 0.80), 'max', 0.010, 'left', (255, 0, 220, 255)),
+        ('biceps_right', (0.67, 0.80), 'max', 0.010, 'right', (255, 0, 220, 255)),
+        ('thigh_left', (0.30, 0.48), 'max', 0.012, 'left', (40, 140, 255, 255)),
+        ('thigh_right', (0.30, 0.48), 'max', 0.012, 'right', (40, 140, 255, 255)),
+    ]
+
+    count = 0
+    for name, rel_range, mode, band, side, color in specs:
+        ring, circ = best_ring_in_window(mesh, rel_range=rel_range, mode=mode, band_rel=band, side=side)
+        ok = add_ring_to_scene(scene, ring, color_rgba=color, node_name=f"ring_{name}")
+        if ok:
+            count += 1
+            print(f"[INFO] Ring {name}: circ={circ:.4f}, range={rel_range}, mode={mode}")
+        else:
+            print(f"[AVISO] Ring {name}: sem pontos suficientes")
+    return count
+
+
+def save_anthropometric_overlay(smpl_gray: trimesh.Trimesh,
+                                out_glb: str,
+                                out_jpg: str) -> None:
+    scene = trimesh.Scene()
+    scene.add_geometry(smpl_gray, node_name='smpl_fit')
+    n_rings = add_anthropometric_rings(scene, smpl_gray)
+    scene.export(out_glb)
+    print(f"[OK] Overlay antropométrico GLB salvo em: {out_glb} (rings={n_rings})")
+
+    try:
+        png = scene.save_image(resolution=(1400, 1000), visible=True)
+        with open(out_jpg, 'wb') as f:
+            f.write(png)
+        print(f"[OK] Overlay antropométrico JPG salvo em: {out_jpg} (rings={n_rings})")
+    except Exception as e:
+        print('[AVISO] Não consegui gerar JPG antropométrico:', e)
+
+
 def save_overlay_image(scan_colored: trimesh.Trimesh,
                        smpl_gray: trimesh.Trimesh,
                        out_jpg: str) -> None:
@@ -244,6 +431,8 @@ def main():
     out_hist_jpg = os.path.join(out_dir, "error_hist.jpg")
     out_overlay_glb = os.path.join(out_dir, "error_overlay.glb")
     out_overlay_jpg = os.path.join(out_dir, "error_overlay.jpg")
+    out_anthro_glb = os.path.join(out_dir, "anthropometric_overlay.glb")
+    out_anthro_jpg = os.path.join(out_dir, "anthropometric_overlay.jpg")
 
     device = choose_device()
     print("[INFO] Usando device:", device)
@@ -273,6 +462,7 @@ def main():
     print("[OK] Histograma salvo em:", out_hist_jpg)
 
     save_overlay_image(scan_colored, smpl_gray, out_overlay_jpg)
+    save_anthropometric_overlay(smpl_gray, out_anthro_glb, out_anthro_jpg)
 
     print_metrics(errors, vmax)
 
@@ -281,6 +471,8 @@ def main():
     print(" -", out_overlay_glb)
     print(" -", out_hist_jpg)
     print(" -", out_overlay_jpg, "(se o render funcionar no WSL)")
+    print(" -", out_anthro_glb)
+    print(" -", out_anthro_jpg, "(se o render funcionar no WSL)")
 
 
 if __name__ == "__main__":
