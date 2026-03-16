@@ -25,6 +25,49 @@ from lib.smpl.priors.th_hand_prior import HandPrior
 from lib.smpl.wrapper_pytorch import SMPLPyTorchWrapperBatchSplitParams
 
 
+# ---------------------------------------------------------------------
+# Landmark / joint definitions inspired by DavidBoja/SMPL-Anthropometry
+# ---------------------------------------------------------------------
+SMPL_LANDMARK_INDICES = {
+    "HEAD_TOP": 412,
+    "LEFT_HEEL": 3458,
+    "RIGHT_HEEL": 6858,
+    "BELLY_BUTTON": 3501,
+    "BACK_BELLY_BUTTON": 3022,
+    "PUBIC_BONE": 3145,
+    "RIGHT_BICEP": 4855,
+    "LEFT_THIGH": 947,
+}
+
+SMPL_JOINT2IND = {
+    'pelvis': 0,
+    'left_hip': 1,
+    'right_hip': 2,
+    'spine1': 3,
+    'left_knee': 4,
+    'right_knee': 5,
+    'spine2': 6,
+    'left_ankle': 7,
+    'right_ankle': 8,
+    'spine3': 9,
+    'left_foot': 10,
+    'right_foot': 11,
+    'neck': 12,
+    'left_collar': 13,
+    'right_collar': 14,
+    'head': 15,
+    'left_shoulder': 16,
+    'right_shoulder': 17,
+    'left_elbow': 18,
+    'right_elbow': 19,
+    'left_wrist': 20,
+    'right_wrist': 21,
+    'left_hand': 22,
+    'right_hand': 23,
+}
+
+
+
 class SMPLHFitter(BaseFitter):
     def fit(self, scans, pose_files, gender='male', save_path=None):
         # Batch size
@@ -185,11 +228,27 @@ class SMPLHFitter(BaseFitter):
         
         loss['chamfer'] = chamfer_loss
 
+
+        # --------------------------------------------------------------
+        # Anthropometric losses: scan target vs SMPL (DavidBoja-inspired)
+        # --------------------------------------------------------------
+        J, face, hands = smpl.get_landmarks()
+        scan_targets = self.scan_measurement_targets(th_scan_meshes)
+        smpl_meas = self.measure_smpl_anthropometrics(verts, J)
+
+        loss['meas_height'] = torch.mean(torch.abs(smpl_meas['height'] - scan_targets['height']))
+        loss['meas_waist'] = torch.mean(torch.abs(smpl_meas['waist_circ'] - scan_targets['waist_circ']))
+        loss['meas_hip'] = torch.mean(torch.abs(smpl_meas['hip_circ'] - scan_targets['hip_circ']))
+        loss['meas_biceps'] = torch.mean(torch.abs(smpl_meas['biceps_circ'] - scan_targets['biceps_circ']))
+        loss['meas_thigh'] = torch.mean(torch.abs(smpl_meas['thigh_circ'] - scan_targets['thigh_circ']))
+
         # regularização de shape
         loss['betas'] = torch.mean(smpl.betas ** 2)
 
         # prior de pose
         loss['pose_pr'] = torch.mean(prior(smpl.pose))
+
+
 
         if self.hands:
             hand_prior = HandPrior(self.model_root, type='grab')
@@ -204,12 +263,14 @@ class SMPLHFitter(BaseFitter):
 
         return loss
 
+    
     @staticmethod
     def _convex_hull_perimeter(points_2d):
         """Perimeter of the convex hull for a Nx2 tensor/array."""
         pts = points_2d.detach().cpu().numpy() if torch.is_tensor(points_2d) else points_2d
         if pts.shape[0] < 3:
             return 0.0
+
         pts = sorted(set((float(x), float(y)) for x, y in pts))
         if len(pts) < 3:
             return 0.0
@@ -257,6 +318,7 @@ class SMPLHFitter(BaseFitter):
         up_min = torch.min(coord_up)
         up_max = torch.max(coord_up)
         h = torch.clamp(up_max - up_min, min=1e-8)
+
         up_target = up_min + rel_height * h
         band = torch.clamp(band_rel * h, min=1e-5)
 
@@ -269,38 +331,60 @@ class SMPLHFitter(BaseFitter):
         pts = verts[keep][:, [lr_axis, depth_axis]]
         if pts.shape[0] < 16:
             return float('nan')
-        return self._convex_hull_perimeter(pts)
 
+        return self._convex_hull_perimeter(pts)
 
     def _best_circumference_in_window(self, verts, rel_range, mode='max', side=None, band_rel=0.012, steps=15):
         rel_values = np.linspace(rel_range[0], rel_range[1], steps)
         best = float('nan')
         best_rel = float('nan')
+
         for rel_h in rel_values:
-            c = self._circumference_at_rel_height(verts, rel_height=float(rel_h), band_rel=band_rel, side=side)
+            c = self._circumference_at_rel_height(
+                verts,
+                rel_height=float(rel_h),
+                band_rel=band_rel,
+                side=side
+            )
             if math.isnan(c):
                 continue
+
             if math.isnan(best):
                 best, best_rel = c, float(rel_h)
                 continue
+
             if (mode == 'max' and c > best) or (mode == 'min' and c < best):
                 best, best_rel = c, float(rel_h)
+
         return best, best_rel
 
     def anthropometric_measurements(self, verts):
-        """Approximate anthropometric measures from adaptive mesh slices (meters)."""
+        """
+        Heuristic scan measurements (meters).
+        Kept as a stable target for scan-vs-SMPL comparison.
+        """
         up_axis, _, _ = self._infer_body_axes(verts)
         up = verts[:, up_axis]
         height = torch.max(up) - torch.min(up)
 
-        chest, chest_rel = self._best_circumference_in_window(verts, rel_range=(0.72, 0.86), mode='max', band_rel=0.012)
-        waist, waist_rel = self._best_circumference_in_window(verts, rel_range=(0.56, 0.70), mode='min', band_rel=0.012)
-        hip, hip_rel = self._best_circumference_in_window(verts, rel_range=(0.45, 0.60), mode='max', band_rel=0.012)
-
-        biceps_l, biceps_l_rel = self._best_circumference_in_window(verts, rel_range=(0.67, 0.80), mode='max', side='left', band_rel=0.010)
-        biceps_r, biceps_r_rel = self._best_circumference_in_window(verts, rel_range=(0.67, 0.80), mode='max', side='right', band_rel=0.010)
-        thigh_l, thigh_l_rel = self._best_circumference_in_window(verts, rel_range=(0.30, 0.48), mode='max', side='left', band_rel=0.012)
-        thigh_r, thigh_r_rel = self._best_circumference_in_window(verts, rel_range=(0.30, 0.48), mode='max', side='right', band_rel=0.012)
+        waist, waist_rel = self._best_circumference_in_window(
+            verts, rel_range=(0.56, 0.70), mode='min', band_rel=0.012
+        )
+        hip, hip_rel = self._best_circumference_in_window(
+            verts, rel_range=(0.45, 0.60), mode='max', band_rel=0.012
+        )
+        biceps_l, biceps_l_rel = self._best_circumference_in_window(
+            verts, rel_range=(0.67, 0.80), mode='max', side='left', band_rel=0.010
+        )
+        biceps_r, biceps_r_rel = self._best_circumference_in_window(
+            verts, rel_range=(0.67, 0.80), mode='max', side='right', band_rel=0.010
+        )
+        thigh_l, thigh_l_rel = self._best_circumference_in_window(
+            verts, rel_range=(0.30, 0.48), mode='max', side='left', band_rel=0.012
+        )
+        thigh_r, thigh_r_rel = self._best_circumference_in_window(
+            verts, rel_range=(0.30, 0.48), mode='max', side='right', band_rel=0.012
+        )
 
         def safe_mean(a, b):
             vals = [v for v in [a, b] if not math.isnan(v)]
@@ -308,13 +392,11 @@ class SMPLHFitter(BaseFitter):
 
         return {
             'height': float(height.detach().cpu().item()),
-            'chest_circ': float(chest),
             'waist_circ': float(waist),
             'hip_circ': float(hip),
             'biceps_circ': safe_mean(biceps_l, biceps_r),
             'thigh_circ': safe_mean(thigh_l, thigh_r),
             'levels_rel': {
-                'chest': chest_rel,
                 'waist': waist_rel,
                 'hip': hip_rel,
                 'biceps_left': biceps_l_rel,
@@ -323,6 +405,163 @@ class SMPLHFitter(BaseFitter):
                 'thigh_right': thigh_r_rel,
             }
         }
+
+    # ------------------------------------------------------------------
+    # Differentiable anthropometric measurements for SMPL
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _safe_vertex_mean(verts_b, index_or_tuple):
+        if isinstance(index_or_tuple, (tuple, list)):
+            idx = torch.as_tensor(index_or_tuple, device=verts_b.device, dtype=torch.long)
+            return verts_b[idx].mean(dim=0)
+        return verts_b[index_or_tuple]
+
+    @staticmethod
+    def _plane_basis_from_normal(normal):
+        normal = normal / torch.clamp(torch.linalg.norm(normal), min=1e-8)
+
+        ref = torch.tensor([1.0, 0.0, 0.0], device=normal.device, dtype=normal.dtype)
+        if torch.abs(torch.dot(normal, ref)) > 0.9:
+            ref = torch.tensor([0.0, 1.0, 0.0], device=normal.device, dtype=normal.dtype)
+
+        u = torch.cross(normal, ref, dim=0)
+        u = u / torch.clamp(torch.linalg.norm(u), min=1e-8)
+        v = torch.cross(normal, u, dim=0)
+        v = v / torch.clamp(torch.linalg.norm(v), min=1e-8)
+        return u, v
+
+    def _soft_slice_circumference(
+        self,
+        verts_b,
+        plane_origin,
+        plane_normal,
+        sigma=0.008,
+        topk=1024
+        ):
+        """
+        Smooth approximation of a circumference by softly selecting
+        vertices near a cutting plane and computing an ordered polygonal loop.
+        """
+        normal = plane_normal / torch.clamp(torch.linalg.norm(plane_normal), min=1e-8)
+        rel = verts_b - plane_origin[None, :]                       # (V, 3)
+        signed_dist = (rel * normal[None, :]).sum(dim=-1)          # (V,)
+        weights = torch.exp(-0.5 * (signed_dist / sigma) ** 2)     # (V,)
+
+        k = min(topk, verts_b.shape[0])
+        topw, idx = torch.topk(weights, k=k, dim=0)
+        pts = rel[idx]                                             # (k, 3)
+
+        u, v = self._plane_basis_from_normal(normal)
+        x = (pts * u[None, :]).sum(dim=-1)
+        y = (pts * v[None, :]).sum(dim=-1)
+
+        denom = torch.clamp(topw.sum(), min=1e-8)
+        cx = (topw * x).sum() / denom
+        cy = (topw * y).sum() / denom
+
+        ang = torch.atan2(y - cy, x - cx)
+        order = torch.argsort(ang)
+
+        xs = x[order]
+        ys = y[order]
+        ws = topw[order]
+
+        xs_next = torch.roll(xs, shifts=-1, dims=0)
+        ys_next = torch.roll(ys, shifts=-1, dims=0)
+        ws_next = torch.roll(ws, shifts=-1, dims=0)
+
+        seg = torch.sqrt((xs_next - xs) ** 2 + (ys_next - ys) ** 2 + 1e-8)
+        seg_w = 0.5 * (ws + ws_next)
+
+        perim = (seg * seg_w).sum() / torch.clamp(seg_w.sum(), min=1e-8)
+        return perim
+
+    def _measure_height_smpl(self, verts_b):
+        up_axis, _, _ = self._infer_body_axes(verts_b)
+        head_top = verts_b[SMPL_LANDMARK_INDICES["HEAD_TOP"], up_axis]
+        heels = verts_b[
+            [SMPL_LANDMARK_INDICES["LEFT_HEEL"], SMPL_LANDMARK_INDICES["RIGHT_HEEL"]],
+            up_axis
+        ].mean()
+        return torch.abs(head_top - heels)
+
+    def _measure_waist_smpl(self, verts_b, joints_b):
+        origin = 0.5 * (
+            verts_b[SMPL_LANDMARK_INDICES["BELLY_BUTTON"]] +
+            verts_b[SMPL_LANDMARK_INDICES["BACK_BELLY_BUTTON"]]
+        )
+        normal = joints_b[SMPL_JOINT2IND["spine3"]] - joints_b[SMPL_JOINT2IND["pelvis"]]
+        return self._soft_slice_circumference(verts_b, origin, normal)
+
+    def _measure_hip_smpl(self, verts_b, joints_b):
+        origin = verts_b[SMPL_LANDMARK_INDICES["PUBIC_BONE"]]
+        normal = joints_b[SMPL_JOINT2IND["spine3"]] - joints_b[SMPL_JOINT2IND["pelvis"]]
+        return self._soft_slice_circumference(verts_b, origin, normal)
+
+    def _measure_biceps_smpl(self, verts_b, joints_b):
+        origin = verts_b[SMPL_LANDMARK_INDICES["RIGHT_BICEP"]]
+        normal = joints_b[SMPL_JOINT2IND["right_shoulder"]] - joints_b[SMPL_JOINT2IND["right_elbow"]]
+        return self._soft_slice_circumference(verts_b, origin, normal)
+
+    def _measure_thigh_smpl(self, verts_b, joints_b):
+        origin = verts_b[SMPL_LANDMARK_INDICES["LEFT_THIGH"]]
+        normal = joints_b[SMPL_JOINT2IND["spine3"]] - joints_b[SMPL_JOINT2IND["pelvis"]]
+        return self._soft_slice_circumference(verts_b, origin, normal)
+
+    def measure_smpl_anthropometrics(self, verts, joints):
+        """
+        verts:  (B, V, 3)
+        joints: (B, J, 3)
+        returns dict[str, Tensor(B,)]
+        """
+        out = {
+            "height": [],
+            "waist_circ": [],
+            "hip_circ": [],
+            "biceps_circ": [],
+            "thigh_circ": [],
+        }
+
+        B = verts.shape[0]
+        for b in range(B):
+            vb = verts[b]
+            jb = joints[b]
+
+            out["height"].append(self._measure_height_smpl(vb))
+            out["waist_circ"].append(self._measure_waist_smpl(vb, jb))
+            out["hip_circ"].append(self._measure_hip_smpl(vb, jb))
+            out["biceps_circ"].append(self._measure_biceps_smpl(vb, jb))
+            out["thigh_circ"].append(self._measure_thigh_smpl(vb, jb))
+
+        for k in out:
+            out[k] = torch.stack(out[k], dim=0)
+
+        return out
+
+    @torch.no_grad()
+    def scan_measurement_targets(self, th_scan_meshes):
+        """
+        Stable, no-grad targets extracted from the scan mesh.
+        """
+        measures = [self.anthropometric_measurements(v) for v in th_scan_meshes.verts_list()]
+        keys = ["height", "waist_circ", "hip_circ", "biceps_circ", "thigh_circ"]
+
+        out = {}
+        device = th_scan_meshes.verts_list()[0].device
+        for k in keys:
+            vals = []
+            for m in measures:
+                v = m[k]
+                if not math.isnan(v):
+                    vals.append(v)
+                else:
+                    vals.append(0.0)
+            out[k] = torch.tensor(vals, dtype=torch.float32, device=device)
+
+        return out
+    
+    
 
     @staticmethod
     def mesh_volume(verts, faces):
@@ -379,7 +618,7 @@ class SMPLHFitter(BaseFitter):
         scan_measures = [self.anthropometric_measurements(v) for v in th_scan_meshes.verts_list()]
         smpl_measures = [self.anthropometric_measurements(v) for v in th_smpl_meshes.verts_list()]
 
-        measure_keys = ['height', 'chest_circ', 'waist_circ', 'hip_circ', 'biceps_circ', 'thigh_circ']
+        measure_keys = ['height', 'waist_circ', 'hip_circ', 'biceps_circ', 'thigh_circ']
         anthropometrics = {}
         for key in measure_keys:
             scan_vals = [m[key] for m in scan_measures if not math.isnan(m[key])]
@@ -515,7 +754,12 @@ class SMPLHFitter(BaseFitter):
                        'pose_pr': lambda cst, it: 10. ** -5 * cst / (1 + it),
                        'hand': lambda cst, it: 10. ** -5 * cst / (1 + it),
                        'lap': lambda cst, it: cst / (1 + it),
-                       'pose_obj': lambda cst, it: 10. ** 2 * cst / (1 + it)
+                       'pose_obj': lambda cst, it: 10. ** 2 * cst / (1 + it),
+                       'meas_height': lambda cst, it: 15.0 * cst,
+                       'meas_waist': lambda cst, it: 10.0 * cst,
+                       'meas_hip': lambda cst, it: 10.0 * cst,
+                       'meas_biceps': lambda cst, it: 5.0 * cst,
+                       'meas_thigh': lambda cst, it: 5.0 * cst
                        }
         return loss_weight
         
