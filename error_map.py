@@ -215,8 +215,6 @@ def convex_hull_2d(points_2d: np.ndarray) -> np.ndarray:
     return np.asarray(hull, dtype=np.float64)
 
 
-<<<<<<< ours
-=======
 def infer_body_axes(vertices: np.ndarray) -> Tuple[int, int, int]:
     """Infer (up, left-right, depth) axes from bbox extents."""
     ext = vertices.max(axis=0) - vertices.min(axis=0)
@@ -229,28 +227,10 @@ def infer_body_axes(vertices: np.ndarray) -> Tuple[int, int, int]:
     return up_axis, lr_axis, depth_axis
 
 
->>>>>>> theirs
 def anthropometric_ring_points(mesh: trimesh.Trimesh,
                                rel_height: float,
                                band_rel: float = 0.012,
                                side: Optional[str] = None) -> np.ndarray:
-<<<<<<< ours
-    """Estimativa de anel 3D (XZ em altura Y fixa) para uma circunferência antropométrica."""
-    verts = np.asarray(mesh.vertices)
-    y = verts[:, 1]
-    y_min, y_max = float(y.min()), float(y.max())
-    h = max(y_max - y_min, 1e-8)
-    y_target = y_min + rel_height * h
-    band = max(band_rel * h, 1e-5)
-
-    keep = np.abs(y - y_target) <= band
-    if side == 'left':
-        keep &= verts[:, 0] > 0
-    elif side == 'right':
-        keep &= verts[:, 0] < 0
-
-    pts = verts[keep][:, [0, 2]]
-=======
     """Estimativa de anel 3D para uma circunferência antropométrica."""
     verts = np.asarray(mesh.vertices)
     up_axis, lr_axis, depth_axis = infer_body_axes(verts)
@@ -268,7 +248,6 @@ def anthropometric_ring_points(mesh: trimesh.Trimesh,
         keep &= verts[:, lr_axis] < 0
 
     pts = verts[keep][:, [lr_axis, depth_axis]]
->>>>>>> theirs
     if pts.shape[0] < 16:
         return np.empty((0, 3), dtype=np.float64)
 
@@ -276,15 +255,10 @@ def anthropometric_ring_points(mesh: trimesh.Trimesh,
     if hull.shape[0] < 3:
         return np.empty((0, 3), dtype=np.float64)
 
-<<<<<<< ours
-    ring = np.column_stack([hull[:, 0], np.full(hull.shape[0], y_target), hull[:, 1]])
-    # fecha o loop
-=======
     ring = np.zeros((hull.shape[0], 3), dtype=np.float64)
     ring[:, lr_axis] = hull[:, 0]
     ring[:, depth_axis] = hull[:, 1]
     ring[:, up_axis] = up_target
->>>>>>> theirs
     ring = np.vstack([ring, ring[:1]])
     return ring
 
