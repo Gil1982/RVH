@@ -63,6 +63,9 @@ class SMPLHFitter(BaseFitter):
                 os.makedirs(save_path)
             with open(os.path.join(save_path, 'fit_score.json'), 'w') as f:
                 json.dump(fit_score, f, indent=2)
+            anthropometric_landmarks = fit_score.get('anthropometric_landmarks', {})
+            with open(os.path.join(save_path, 'anthropometric_landmarks.json'), 'w') as f:
+                json.dump(anthropometric_landmarks, f, indent=2)
             return self.save_outputs(save_path, scans, smpl, th_scan_meshes, save_name='smplh' if self.hands else 'smpl')
 
         return fit_score
@@ -195,19 +198,21 @@ class SMPLHFitter(BaseFitter):
             hand_prior = HandPrior(self.model_root, type='grab')
             loss['hand'] = torch.mean(hand_prior(smpl.pose))
 
+        J, face, hands = smpl.get_landmarks()
+
         if th_pose_3d is not None:
             # 3D joints loss
-            J, face, hands = smpl.get_landmarks()
             joints = self.compose_smpl_joints(J, face, hands, th_pose_3d)
             j3d_loss = batch_3djoints_loss(th_pose_3d, joints)
             loss['pose_obj'] = j3d_loss
 
-        # Anthropometric consistency loss (scan vs SMPL)
+        # Anthropometric consistency loss (scan vs SMPL), guided by SMPL landmarks
         measure_keys = ['height', 'chest_circ', 'waist_circ', 'hip_circ', 'biceps_circ', 'thigh_circ']
         anthropo_terms = []
-        for scan_verts, smpl_verts in zip(th_scan_meshes.verts_list(), verts):
-            scan_m = self.anthropometric_measurements(scan_verts)
-            smpl_m = self.anthropometric_measurements(smpl_verts)
+        for b, (scan_verts, smpl_verts) in enumerate(zip(th_scan_meshes.verts_list(), verts)):
+            levels_rel = self._landmark_levels_rel_from_joints(smpl_verts, J[b])
+            scan_m = self.anthropometric_measurements(scan_verts, levels_rel=levels_rel)
+            smpl_m = self.anthropometric_measurements(smpl_verts, levels_rel=levels_rel)
             for k in measure_keys:
                 scan_v = scan_m[k]
                 smpl_v = smpl_m[k]
@@ -266,6 +271,148 @@ class SMPLHFitter(BaseFitter):
             lr_axis, depth_axis = rem[1], rem[0]
         return up_axis, lr_axis, depth_axis
 
+    def _landmark_levels_rel_from_joints(self, verts, joints):
+        """Landmark-guided anthropometric levels (inspired by SMPL landmark definitions)."""
+        up_axis, _, _ = self._infer_body_axes(verts)
+        up = verts[:, up_axis]
+        up_min = torch.min(up)
+        h = torch.clamp(torch.max(up) - up_min, min=1e-8)
+
+        idx = self._anthropometric_joint_indices(joints)
+        pelvis_i = idx['pelvis']
+        l_hip_i, r_hip_i = idx['left_hip'], idx['right_hip']
+        spine2_i = idx['spine2']
+        l_shoulder_i, r_shoulder_i = idx['left_shoulder'], idx['right_shoulder']
+        l_elbow_i, r_elbow_i = idx['left_elbow'], idx['right_elbow']
+        l_knee_i, r_knee_i = idx['left_knee'], idx['right_knee']
+
+        pelvis = joints[pelvis_i, up_axis]
+        hip_mid = 0.5 * (joints[l_hip_i, up_axis] + joints[r_hip_i, up_axis])
+        chest_mid = 0.5 * (joints[l_shoulder_i, up_axis] + joints[r_shoulder_i, up_axis])
+        waist_mid = 0.5 * (pelvis + joints[spine2_i, up_axis])
+
+        biceps_l = 0.5 * (joints[l_shoulder_i, up_axis] + joints[l_elbow_i, up_axis])
+        biceps_r = 0.5 * (joints[r_shoulder_i, up_axis] + joints[r_elbow_i, up_axis])
+        thigh_l = 0.5 * (joints[l_hip_i, up_axis] + joints[l_knee_i, up_axis])
+        thigh_r = 0.5 * (joints[r_hip_i, up_axis] + joints[r_knee_i, up_axis])
+
+        def to_rel(v):
+            rel = (v - up_min) / h
+            rel = torch.clamp(rel, 0.02, 0.98)
+            return float(rel.detach().cpu().item())
+
+        return {
+            'chest': to_rel(chest_mid),
+            'waist': to_rel(waist_mid),
+            'hip': to_rel(hip_mid),
+            'biceps_left': to_rel(biceps_l),
+            'biceps_right': to_rel(biceps_r),
+            'thigh_left': to_rel(thigh_l),
+            'thigh_right': to_rel(thigh_r),
+        }
+
+    @staticmethod
+    def _anthropometric_joint_indices(joints):
+        """
+        Resolve the joint index convention used by `smpl.get_landmarks()`.
+
+        BODY_25/OpenPose layout places shoulders at 2/5, elbows at 3/6, pelvis at 8,
+        hips at 9/12 and knees at 10/13. Older SMPL body-joint layouts use the
+        canonical 24-joint indexing.
+        """
+        n_joints = int(joints.shape[0])
+        if n_joints >= 25:
+            return {
+                'pelvis': 8,
+                'spine2': 1,
+                'right_shoulder': 2,
+                'right_elbow': 3,
+                'right_hip': 9,
+                'right_knee': 10,
+                'left_shoulder': 5,
+                'left_elbow': 6,
+                'left_hip': 12,
+                'left_knee': 13,
+            }
+
+        return {
+            'pelvis': 0,
+            'left_hip': 1,
+            'right_hip': 2,
+            'left_knee': 4,
+            'right_knee': 5,
+            'spine2': 6,
+            'left_shoulder': 16,
+            'right_shoulder': 17,
+            'left_elbow': 18,
+            'right_elbow': 19,
+        }
+
+    def _anthropometric_landmark_points_from_joints(self, joints):
+        """Return joint-based reference points used for anthropometric levels."""
+        idx = self._anthropometric_joint_indices(joints)
+        pelvis_i = idx['pelvis']
+        l_hip_i, r_hip_i = idx['left_hip'], idx['right_hip']
+        l_knee_i, r_knee_i = idx['left_knee'], idx['right_knee']
+        spine2_i = idx['spine2']
+        l_shoulder_i, r_shoulder_i = idx['left_shoulder'], idx['right_shoulder']
+        l_elbow_i, r_elbow_i = idx['left_elbow'], idx['right_elbow']
+
+        def midpoint(a, b):
+            return 0.5 * (joints[a] + joints[b])
+
+        return {
+            'chest': {
+                'point': midpoint(l_shoulder_i, r_shoulder_i),
+                'landmarks': {
+                    'left_shoulder': joints[l_shoulder_i],
+                    'right_shoulder': joints[r_shoulder_i],
+                }
+            },
+            'waist': {
+                'point': midpoint(pelvis_i, spine2_i),
+                'landmarks': {
+                    'pelvis': joints[pelvis_i],
+                    'spine2': joints[spine2_i],
+                }
+            },
+            'hip': {
+                'point': midpoint(l_hip_i, r_hip_i),
+                'landmarks': {
+                    'left_hip': joints[l_hip_i],
+                    'right_hip': joints[r_hip_i],
+                }
+            },
+            'biceps_left': {
+                'point': midpoint(l_shoulder_i, l_elbow_i),
+                'landmarks': {
+                    'left_shoulder': joints[l_shoulder_i],
+                    'left_elbow': joints[l_elbow_i],
+                }
+            },
+            'biceps_right': {
+                'point': midpoint(r_shoulder_i, r_elbow_i),
+                'landmarks': {
+                    'right_shoulder': joints[r_shoulder_i],
+                    'right_elbow': joints[r_elbow_i],
+                }
+            },
+            'thigh_left': {
+                'point': midpoint(l_hip_i, l_knee_i),
+                'landmarks': {
+                    'left_hip': joints[l_hip_i],
+                    'left_knee': joints[l_knee_i],
+                }
+            },
+            'thigh_right': {
+                'point': midpoint(r_hip_i, r_knee_i),
+                'landmarks': {
+                    'right_hip': joints[r_hip_i],
+                    'right_knee': joints[r_knee_i],
+                }
+            },
+        }
+
     def _circumference_at_rel_height_torch(self, verts, rel_height, band_rel=0.01, side=None):
         """Differentiable circumference proxy from a soft horizontal slice."""
         up_axis, lr_axis, depth_axis = self._infer_body_axes(verts)
@@ -279,10 +426,7 @@ class SMPLHFitter(BaseFitter):
         up_target = up_min + rel_height * h
         band = torch.clamp(band_rel * h, min=1e-5)
 
-        # Gaussian soft slice weights (keeps differentiability)
         w = torch.exp(-0.5 * ((up - up_target) / band) ** 2)
-
-        # Side selection (soft) for unilateral measures
         if side == 'left':
             w = w * torch.sigmoid(40.0 * lr)
         elif side == 'right':
@@ -295,36 +439,33 @@ class SMPLHFitter(BaseFitter):
         mu_depth = torch.sum(w * depth)
         radial = torch.sqrt((lr - mu_lr) ** 2 + (depth - mu_depth) ** 2 + 1e-8)
         mean_r = torch.sum(w * radial)
-
-        # Circunferência aproximada por raio médio
         return 2.0 * torch.tensor(np.pi, device=verts.device, dtype=verts.dtype) * mean_r
 
-    def _best_circumference_in_window_torch(self, verts, rel_range, mode='max', side=None, band_rel=0.012, steps=15):
-        rel_values = np.linspace(rel_range[0], rel_range[1], steps)
-        vals = []
-        for rel_h in rel_values:
-            vals.append(self._circumference_at_rel_height_torch(verts, rel_height=float(rel_h), band_rel=band_rel, side=side))
-        vals = torch.stack(vals)
-        if mode == 'max':
-            idx = torch.argmax(vals)
-        else:
-            idx = torch.argmin(vals)
-        return vals[idx], float(rel_values[int(idx.item())])
-
-    def anthropometric_measurements(self, verts):
-        """Anthropometric measures (torch tensors, differentiable where possible)."""
+    def anthropometric_measurements(self, verts, levels_rel=None):
+        """Anthropometric measures guided by landmarks/levels."""
         up_axis, _, _ = self._infer_body_axes(verts)
         up = verts[:, up_axis]
         height = torch.max(up) - torch.min(up)
 
-        chest, chest_rel = self._best_circumference_in_window_torch(verts, rel_range=(0.72, 0.86), mode='max', band_rel=0.012)
-        waist, waist_rel = self._best_circumference_in_window_torch(verts, rel_range=(0.56, 0.70), mode='min', band_rel=0.012)
-        hip, hip_rel = self._best_circumference_in_window_torch(verts, rel_range=(0.45, 0.60), mode='max', band_rel=0.012)
+        if levels_rel is None:
+            levels_rel = {
+                'chest': 0.78,
+                'waist': 0.62,
+                'hip': 0.53,
+                'biceps_left': 0.74,
+                'biceps_right': 0.74,
+                'thigh_left': 0.42,
+                'thigh_right': 0.42,
+            }
 
-        biceps_l, biceps_l_rel = self._best_circumference_in_window_torch(verts, rel_range=(0.67, 0.80), mode='max', side='left', band_rel=0.010)
-        biceps_r, biceps_r_rel = self._best_circumference_in_window_torch(verts, rel_range=(0.67, 0.80), mode='max', side='right', band_rel=0.010)
-        thigh_l, thigh_l_rel = self._best_circumference_in_window_torch(verts, rel_range=(0.30, 0.48), mode='max', side='left', band_rel=0.012)
-        thigh_r, thigh_r_rel = self._best_circumference_in_window_torch(verts, rel_range=(0.30, 0.48), mode='max', side='right', band_rel=0.012)
+        chest = self._circumference_at_rel_height_torch(verts, float(levels_rel['chest']), band_rel=0.012)
+        waist = self._circumference_at_rel_height_torch(verts, float(levels_rel['waist']), band_rel=0.012)
+        hip = self._circumference_at_rel_height_torch(verts, float(levels_rel['hip']), band_rel=0.012)
+
+        biceps_l = self._circumference_at_rel_height_torch(verts, float(levels_rel['biceps_left']), band_rel=0.010, side='left')
+        biceps_r = self._circumference_at_rel_height_torch(verts, float(levels_rel['biceps_right']), band_rel=0.010, side='right')
+        thigh_l = self._circumference_at_rel_height_torch(verts, float(levels_rel['thigh_left']), band_rel=0.012, side='left')
+        thigh_r = self._circumference_at_rel_height_torch(verts, float(levels_rel['thigh_right']), band_rel=0.012, side='right')
 
         return {
             'height': height,
@@ -333,15 +474,7 @@ class SMPLHFitter(BaseFitter):
             'hip_circ': hip,
             'biceps_circ': 0.5 * (biceps_l + biceps_r),
             'thigh_circ': 0.5 * (thigh_l + thigh_r),
-            'levels_rel': {
-                'chest': chest_rel,
-                'waist': waist_rel,
-                'hip': hip_rel,
-                'biceps_left': biceps_l_rel,
-                'biceps_right': biceps_r_rel,
-                'thigh_left': thigh_l_rel,
-                'thigh_right': thigh_r_rel,
-            }
+            'levels_rel': levels_rel,
         }
 
     @staticmethod
@@ -395,9 +528,14 @@ class SMPLHFitter(BaseFitter):
         eps = torch.tensor(1e-8, device=scan_vols.device, dtype=scan_vols.dtype)
         vol_diff_pct = 100.0 * torch.abs(smpl_vols - scan_vols) / torch.clamp(scan_vols, min=eps)
 
-        # Anthropometric metrics (scan vs SMPL)
-        scan_measures = [self.anthropometric_measurements(v) for v in th_scan_meshes.verts_list()]
-        smpl_measures = [self.anthropometric_measurements(v) for v in th_smpl_meshes.verts_list()]
+        # Anthropometric metrics (scan vs SMPL), landmark-guided
+        J, _, _ = smpl.get_landmarks()
+        scan_measures = []
+        smpl_measures = []
+        for b, (scan_v, smpl_v) in enumerate(zip(th_scan_meshes.verts_list(), th_smpl_meshes.verts_list())):
+            levels_rel = self._landmark_levels_rel_from_joints(smpl_v, J[b])
+            scan_measures.append(self.anthropometric_measurements(scan_v, levels_rel=levels_rel))
+            smpl_measures.append(self.anthropometric_measurements(smpl_v, levels_rel=levels_rel))
 
         measure_keys = ['height', 'chest_circ', 'waist_circ', 'hip_circ', 'biceps_circ', 'thigh_circ']
         anthropometrics = {}
@@ -417,6 +555,19 @@ class SMPLHFitter(BaseFitter):
             }
 
         anthropometric_levels_rel = smpl_measures[0].get('levels_rel', {}) if len(smpl_measures) > 0 else {}
+        anthropometric_landmarks = {}
+        if J.shape[0] > 0:
+            landmark_dict = self._anthropometric_landmark_points_from_joints(J[0])
+            anthropometric_landmarks = {
+                measure_name: {
+                    'point': [float(v) for v in info['point'].detach().cpu().tolist()],
+                    'landmarks': {
+                        lm_name: [float(v) for v in lm_point.detach().cpu().tolist()]
+                        for lm_name, lm_point in info['landmarks'].items()
+                    }
+                }
+                for measure_name, info in landmark_dict.items()
+            }
 
         geom = s2m + m2s
         score = 1.0 / (1.0 + geom + chamfer)
@@ -431,7 +582,8 @@ class SMPLHFitter(BaseFitter):
             'volume_diff_pct': float(torch.mean(vol_diff_pct).detach().cpu().item()),
             'fit_score': float(score.detach().cpu().item()),
             'anthropometrics': anthropometrics,
-            'anthropometric_levels_rel': anthropometric_levels_rel
+            'anthropometric_levels_rel': anthropometric_levels_rel,
+            'anthropometric_landmarks': anthropometric_landmarks
         }
 
 
